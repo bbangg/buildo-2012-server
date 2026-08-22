@@ -1,0 +1,37 @@
+# --- build output (every one of these is rebuilt by a command in docs/SETUP.md) ---
+gs
+poke.exe
+shot.exe
+tools/*.exe
+tools/*.dll
+*.o
+__pycache__/
+.venv/
+
+# --- generated data ---
+items.dat
+tools/items_*.dat
+cache/
+
+# --- run logs and scratch ---
+*.log
+exit.txt
+response.txt
+worlds/
+shot*.png
+*.req
+
+# --- editor / OS noise ---
+.DS_Store
+*.bak
+*.pre-rewrite
+*.swp
+
+# --- never redistribute the game itself ---
+Buildo.exe
+Buildo-local.exe
+audiere.dll
+zlib1.dll
+game/
+interface/
+audio/
