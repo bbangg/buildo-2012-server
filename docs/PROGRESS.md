@@ -356,6 +356,8 @@ is the only channel that can reach them: `tile_removed` on a break,
 
 ## Current status
 
+![Every special tile in one world](img/features.png)
+
 Verified by screenshot and by reading the client's own memory:
 
 * the world loads, renders and persists **in the server process**

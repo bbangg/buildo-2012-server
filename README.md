@@ -13,6 +13,20 @@ constants.
 It runs on macOS under Wine. No root, no internet, and your copy of the game is
 never written to.
 
+![The START world: the main door, a sign, a lock with its area outline, a
+boombox, the Olde Timey Radio, a ripe tree bearing the block it grew from, and
+a run of wood platforms overhead](docs/img/features.png)
+
+<sub>A generated world with every special tile turned on
+(`BUILDO_FEAT=dslpbrw BUILDO_SEED_STAGE=6`). The wood platform and the tree
+fruit are both restorations argued from unclaimed art — see
+[PROGRESS.md phase 10](docs/PROGRESS.md#phase-10--the-items-the-art-proves-and-the-data-lacks).</sub>
+
+| | |
+|---|---|
+| ![A fresh world](docs/img/world.png) | ![The inventory panel open](docs/img/inventory.png) |
+| A fresh world, first connect. `Local Buildo server connected.` | All 52 items, right sprites, border colour per material |
+
 ---
 
 ## What this is, and what it is not
