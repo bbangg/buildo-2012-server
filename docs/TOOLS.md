@@ -111,6 +111,7 @@ set them to the honest value if you want only what is provably original (see
 
 | variable | default | what it does |
 |---|---|---|
+| `BUILDO_PLAYER_DIR` | `players` | directory for persistent clothing and skin profiles, keyed by player name |
 | `BUILDO_INV` | starter kit | inventory as `id:count,id:count,…` |
 | `BUILDO_WEAR` | — | worn items as `id,id,…` |
 | `BUILDO_GEM_CHANCE` | `50` | percent chance a broken block drops gems — **ours**; `0` turns gem drops off |

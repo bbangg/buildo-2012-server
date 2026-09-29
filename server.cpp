@@ -1006,6 +1006,73 @@ static void refresh_clothing(Player& pl) {
     }
 }
 
+/* Cosmetics are account state rather than world state. The prototype has no
+   authentication, so the requested player name is the stable profile key. */
+static std::string player_dir() {
+    const char* p = getenv("BUILDO_PLAYER_DIR");
+    return (p && *p) ? p : "players";
+}
+
+static std::string player_path(const std::string& name) {
+    static const char hex[] = "0123456789abcdef";
+    std::string out = player_dir() + "/";
+    for (size_t i = 0; i < name.size(); ++i) {
+        unsigned char c = (unsigned char)name[i];
+        out += hex[c >> 4]; out += hex[c & 15];
+    }
+    return out + ".bplayer";
+}
+
+static bool save_player(const Player& pl) {
+    if (pl.name.empty()) return false;
+    std::string dir = player_dir();
+    if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) return false;
+    std::string path = player_path(pl.name), tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    fwrite("BLDPLAYER", 1, 9, f); file_u32(f, 1); file_string(f, pl.name);
+    file_u32(f, pl.skin);
+    for (size_t i = 0; i < 6; ++i) file_u16(f, pl.cloth[i]);
+    bool ok = !ferror(f) && fflush(f) == 0;
+    if (fclose(f) != 0) ok = false;
+    if (ok) ok = rename(tmp.c_str(), path.c_str()) == 0;
+    if (!ok) remove(tmp.c_str());
+    return ok;
+}
+
+static bool load_player(Player& pl) {
+    FILE* f = fopen(player_path(pl.name).c_str(), "rb");
+    if (!f) return false;
+    char magic[9]; uint32_t version, skin; std::string savedName;
+    uint16_t clothes[6] = {};
+    bool ok = read_exact(f, magic, 9) && memcmp(magic, "BLDPLAYER", 9) == 0 &&
+              read_u32(f, version) && version == 1 &&
+              read_string(f, savedName, 1024) && savedName == pl.name &&
+              read_u32(f, skin);
+    for (size_t i = 0; ok && i < 6; ++i) ok = read_u16(f, clothes[i]);
+    fclose(f);
+    if (!ok) return false;
+
+    pl.skin = skin;
+    for (size_t i = 0; i < pl.inv.size(); ++i) pl.inv[i].flags &= (uint8_t)~1;
+    for (size_t part = 0; part < 6; ++part) {
+        uint16_t id = clothes[part];
+        const ItemDef* d = def(id);
+        if (!id || !d || d->material != MAT_CLOTHES || d->bodyPart != part) continue;
+        if (!inv_has(pl, id)) inv_add(pl, id, 1);
+        for (size_t i = 0; i < pl.inv.size(); ++i)
+            if (pl.inv[i].id == id) pl.inv[i].flags |= 1;
+    }
+    refresh_clothing(pl);
+    printf("[gs] loaded cosmetics for '%s'\n", pl.name.c_str());
+    return true;
+}
+
+static void save_all_players() {
+    for (std::map<ENetPeer*, Player>::const_iterator it = g_players.begin();
+         it != g_players.end(); ++it) save_player(it->second);
+}
+
 /* OnSetClothing(vec3 slots 0-2, vec3 slots 3-5, uint32 skin colour).
    The handler at 0x448ad0 reads both vec3s field by field, rounds each to a
    uint16 and writes six slots; the third argument goes to 0x449ff0 as the
@@ -1746,6 +1813,7 @@ static void handle_wear(ENetPeer* peer, Player& pl, int itemId) {
         }
     }
     refresh_clothing(pl);
+    save_player(pl);
     send_inventory(peer, pl);
     send_clothing(peer, pl);
     for (std::map<ENetPeer*, Player>::iterator it = g_players.begin();
@@ -1929,6 +1997,8 @@ int main() {
                         pl.name = get_field(txt, "requestedName");
                         if (pl.name.empty()) pl.name = "Player";
                         give_starter_kit(pl);
+                        refresh_clothing(pl);
+                        load_player(pl);
                         printf("\n[gs] LOGIN '%s' (netID %d), items hash %d -> client\n",
                                pl.name.c_str(), pl.netID, (int32_t)g_itemHash);
                         console(ev.peer, "`2Local Buildo server`` connected.");
@@ -2003,6 +2073,7 @@ int main() {
                         std::string c = get_field(txt, "color");
                         if (!c.empty()) {
                             pl.skin = (uint32_t)strtoul(c.c_str(), NULL, 10);
+                            save_player(pl);
                             printf("  ** %s skin 0x%08x\n", pl.name.c_str(), pl.skin);
                             if (pl.inWorld) {
                                 send_clothing(ev.peer, pl);
@@ -2171,6 +2242,7 @@ int main() {
             case ENET_EVENT_TYPE_DISCONNECT: {
                 Player& pl = g_players[ev.peer];
                 printf("\n[gs] DISCONNECT %s\n", pl.name.c_str());
+                save_player(pl);
                 leave_world(ev.peer, pl);
                 g_players.erase(ev.peer);
                 fflush(stdout);
@@ -2180,4 +2252,10 @@ int main() {
             }
         }
     }
+    printf("[gs] saving worlds before shutdown\n");
+    save_all_worlds();
+    save_all_players();
+    enet_host_destroy(host);
+    enet_deinitialize();
+    return 0;
 }
