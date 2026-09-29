@@ -94,10 +94,12 @@ Verified by screenshot and by reading the client's own parsed memory — not by
 - gems land on the counter in the corner
 - lava kills you
 - `/dance` and `/wave`
+- worlds persist across server restarts (tiles, plants, dropped objects and locks)
+- directional signs and radios face the direction the placing character faces
+- worn clothes and skin tone persist per player name
 
 **Not working**
 
-- world persistence to disk — worlds live in the `gs` process and die with it
 - the SHOP / STORE buttons
 - multiplayer beyond one client (untested, not known-broken)
 
