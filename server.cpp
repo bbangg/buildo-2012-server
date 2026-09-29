@@ -402,6 +402,7 @@ struct TileExtra {
 
 struct Tile {
     uint16_t  fg = 0, bg = 0;
+    uint16_t  flags = 0;        // bit 0x20 mirrors directional tile artwork
     TileExtra extra;
     uint8_t   damage = 0;       // punches taken, mirrors client Tile+0x28
     time_t    healAt = 0;
@@ -606,13 +607,12 @@ static std::vector<uint8_t> serialize_world(WorldData& w) {
     for (int y = 0; y < w.h; ++y) {
         for (int x = 0; x < w.w; ++x) {
             Tile& t = w.at(x, y);
-            /* Keep flags at 0: the client sets bit 0 itself for the materials
-               that need an extra, and setting it here for one that does not
-               would make it read an extra we never wrote. */
+            /* Only persist the artwork-mirror bit. The client sets bit 0
+               itself for materials that need a TileExtra. */
             w16(b, t.fg);
             w16(b, t.bg);
             w16(b, 0);
-            w16(b, 0);
+            w16(b, (uint16_t)(t.flags & 0x20));
             const ItemDef* d = def(t.fg);
             int want = d ? extra_type_for_material(d->material) : 0;
             if (want && !getenv("BUILDO_NO_EXTRA")) {
@@ -881,13 +881,14 @@ static void console(ENetPeer* p, const std::string& msg) {
  * not a NetObject it knows (0x433b7d).
  */
 static void send_set_tile(const std::string& world, int x, int y, int itemId,
-                          int actorNetID) {
+                          int actorNetID, bool flipped = false) {
     GameUpdatePacket g{};
     g.packetType = 3;
     g.netID      = actorNetID;
     g.intData    = itemId;
     g.intX       = x;
     g.intY       = y;
+    if (flipped) g.flags |= 0x10; /* ApplyPacket turns this into tile flag 0x20 */
     broadcast_gup(world, g);
 }
 
@@ -1135,7 +1136,7 @@ static void send_tile_update(const std::string& world, int x, int y, Tile& t) {
     w16(b, t.fg);
     w16(b, t.bg);
     w16(b, 0);
-    w16(b, 0);
+    w16(b, (uint16_t)(t.flags & 0x20));
     const ItemDef* d = def(t.fg);
     int want = d ? extra_type_for_material(d->material) : 0;
     if (want) {
@@ -1276,7 +1277,8 @@ static void harvest_tree(ENetPeer* peer, Player& pl, WorldData& w, int x, int y,
                          uint16_t seedId) {
     play_at(w.name, pl.netID, "audio/tree_harvest.wav");
     Tile& t = w.at(x, y);
-    t.fg = 0; t.extra = TileExtra(); t.damage = 0; t.healAt = 0; t.plantedAt = 0;
+    t.fg = 0; t.flags = 0; t.extra = TileExtra();
+    t.damage = 0; t.healAt = 0; t.plantedAt = 0;
     send_set_tile(w.name, x, y, IT_FIST, pl.netID);
     /* Seeds sit at blockId + 1 in item_definitions.txt and the client proves
        the pairing by hanging that very block on the ripe tree as fruit, so the
@@ -1331,8 +1333,8 @@ static void handle_punch(ENetPeer* peer, Player& pl, WorldData& w, int x, int y)
 
     /* broken: clear the same layer the client will clear, and hand it over */
     t.damage = 0; t.healAt = 0;
-    if (t.fg) { t.fg = 0; t.extra = TileExtra(); }
-    else      { t.bg = 0; }
+    if (t.fg) { t.fg = 0; t.flags = 0; t.extra = TileExtra(); }
+    else      { t.bg = 0; t.flags = 0; }
     send_set_tile(w.name, x, y, IT_FIST, pl.netID);
     play_at(w.name, pl.netID, "audio/tile_removed.wav");
     /* The block does not teleport into your pockets any more: it lands in the
@@ -1353,7 +1355,7 @@ static void place_refused(int x, int y, const char* why, const ItemDef* d) {
 }
 
 static void handle_place(ENetPeer* peer, Player& pl, WorldData& w, int x, int y,
-                         int itemId) {
+                         int itemId, bool flipped) {
     const ItemDef* d = def(itemId);
     if (!d) { printf("  -- place refused: no such item %d\n", itemId); return; }
     Tile& t = w.at(x, y);
@@ -1398,13 +1400,14 @@ static void handle_place(ENetPeer* peer, Player& pl, WorldData& w, int x, int y,
             if (want == 3) t.extra.u1 = (uint32_t)pl.netID;   // lock owner
         }
     }
+    t.flags = flipped ? 0x20 : 0;
     t.damage = 0; t.healAt = 0;
 
     /* The client deducts one from its own inventory when it sees this packet
        with itself as the actor (0x433ca6 -> 0x43d800), so the server makes
        the same deduction and does not resend the inventory. */
     inv_take(pl, (uint16_t)itemId, 1);
-    send_set_tile(w.name, x, y, itemId, pl.netID);
+    send_set_tile(w.name, x, y, itemId, pl.netID, flipped);
     send_take_item(w.name, itemId, 1);
     /* A lock claims the ground around it the moment it goes down. */
     if (d->material == MAT_LOCK) {
@@ -1968,7 +1971,8 @@ int main() {
                         else if (held->material == MAT_WRENCH)
                             handle_wrench(ev.peer, pl, w, x, y);
                         else
-                            handle_place(ev.peer, pl, w, x, y, g->intData);
+                            handle_place(ev.peer, pl, w, x, y, g->intData,
+                                         (g->flags & 0x10) != 0);
                         fflush(stdout);
                         enet_packet_destroy(ev.packet);
                         break;
