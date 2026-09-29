@@ -58,6 +58,17 @@ against.
 
     ~/buildo-server/play.sh            # or: play.sh SOMEWORLD
 
+### Linux
+
+With the original game in `../OldAssBuildoWinFrom2012`, build once and then
+start the server:
+
+    ./linux-build.sh
+    ./linux-server.sh
+
+Launch `run/Buildo-local.exe` with Wine separately. The original game files
+are left unchanged.
+
 ---
 
 ## Status

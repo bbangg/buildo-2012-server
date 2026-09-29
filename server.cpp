@@ -1930,8 +1930,15 @@ int main() {
     if (const char* e = getenv("BUILDO_ITEMS")) itemsPath = e;
     else {
         char buf[4096];
+        bool haveExe = false;
+#ifdef __APPLE__
         uint32_t sz = sizeof buf;
-        if (_NSGetExecutablePath(buf, &sz) == 0) {
+        haveExe = (_NSGetExecutablePath(buf, &sz) == 0);
+#elif defined(__linux__)
+        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (n >= 0) { buf[n] = '\0'; haveExe = true; }
+#endif
+        if (haveExe) {
             std::string exe(buf);
             size_t slash = exe.find_last_of('/');
             if (slash != std::string::npos) itemsPath = exe.substr(0, slash) + "/items.dat";
