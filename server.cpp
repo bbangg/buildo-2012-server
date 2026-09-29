@@ -17,15 +17,22 @@
  *    1 call function    9 inventory      14 objects     16 item database
  */
 #include <enet/enet.h>
+#ifdef __APPLE__
 #include <mach-o/dyld.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
+#include <cerrno>
+#include <csignal>
 #include <string>
 #include <vector>
 #include <map>
+#include <sys/stat.h>
 
 /* ---------- Proton NetMessage ids ---------- */
 enum {
@@ -456,6 +463,161 @@ struct WorldData {
 };
 
 static std::map<std::string, WorldData> g_worlds;
+static volatile sig_atomic_t g_stop = 0;
+
+static void request_stop(int) { g_stop = 1; }
+
+/* ---------- World persistence ----------
+   This is deliberately a server-owned format, separate from the client world
+   blob. Files are replaced atomically so an interrupted write keeps the last
+   good copy. World names are hex-encoded, so names such as ../foo can never
+   escape the save directory. */
+static std::string world_dir() {
+    const char* p = getenv("BUILDO_WORLD_DIR");
+    return (p && *p) ? p : "worlds";
+}
+
+static std::string world_path(const std::string& name) {
+    static const char hex[] = "0123456789abcdef";
+    std::string out = world_dir() + "/";
+    for (size_t i = 0; i < name.size(); ++i) {
+        unsigned char c = (unsigned char)name[i];
+        out += hex[c >> 4]; out += hex[c & 15];
+    }
+    return out + ".bworld";
+}
+
+static bool ensure_world_dir() {
+    std::string dir = world_dir();
+    if (mkdir(dir.c_str(), 0755) == 0 || errno == EEXIST) return true;
+    fprintf(stderr, "[gs] cannot create world directory '%s': %s\n",
+            dir.c_str(), strerror(errno));
+    return false;
+}
+
+static void file_u8(FILE* f, uint8_t v) { fwrite(&v, 1, 1, f); }
+static void file_u16(FILE* f, uint16_t v) { fwrite(&v, sizeof v, 1, f); }
+static void file_u32(FILE* f, uint32_t v) { fwrite(&v, sizeof v, 1, f); }
+static void file_i64(FILE* f, int64_t v) { fwrite(&v, sizeof v, 1, f); }
+static void file_float(FILE* f, float v) { fwrite(&v, sizeof v, 1, f); }
+static void file_string(FILE* f, const std::string& s) {
+    file_u32(f, (uint32_t)s.size());
+    if (!s.empty()) fwrite(s.data(), 1, s.size(), f);
+}
+
+static bool save_world(const WorldData& w) {
+    if (!ensure_world_dir()) return false;
+    std::string path = world_path(w.name), tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) {
+        fprintf(stderr, "[gs] cannot open world save '%s': %s\n",
+                tmp.c_str(), strerror(errno));
+        return false;
+    }
+    fwrite("BLDWORLD", 1, 8, f); file_u32(f, 2);
+    file_string(f, w.name); file_u32(f, (uint32_t)w.w); file_u32(f, (uint32_t)w.h);
+    file_u32(f, (uint32_t)w.spawnX); file_u32(f, (uint32_t)w.spawnY);
+    file_u32(f, (uint32_t)w.tiles.size());
+    for (size_t i = 0; i < w.tiles.size(); ++i) {
+        const Tile& t = w.tiles[i];
+        file_u16(f, t.fg); file_u16(f, t.bg); file_u16(f, t.flags);
+        file_u8(f, t.damage);
+        file_i64(f, (int64_t)t.healAt); file_i64(f, (int64_t)t.plantedAt);
+        file_u8(f, t.extra.type); file_string(f, t.extra.s1);
+        file_string(f, t.extra.s2); file_string(f, t.extra.s3);
+        file_u8(f, t.extra.b1); file_u32(f, t.extra.u1);
+        file_u32(f, t.extra.age); file_u8(f, t.extra.stage);
+        file_u32(f, (uint32_t)t.extra.list.size());
+        for (size_t k = 0; k < t.extra.list.size(); ++k) file_u32(f, t.extra.list[k]);
+    }
+    file_u32(f, w.nextObjectId); file_u32(f, (uint32_t)w.objects.size());
+    for (size_t i = 0; i < w.objects.size(); ++i) {
+        const WorldObject& o = w.objects[i];
+        file_u32(f, o.id); file_u16(f, o.itemId); file_float(f, o.x); file_float(f, o.y);
+        file_u8(f, o.count); file_u8(f, o.flags);
+    }
+    file_u32(f, (uint32_t)w.locks.size());
+    for (size_t i = 0; i < w.locks.size(); ++i) {
+        const WorldLock& l = w.locks[i];
+        file_u32(f, (uint32_t)l.x); file_u32(f, (uint32_t)l.y);
+        file_u32(f, (uint32_t)l.owner); file_u32(f, (uint32_t)l.tiles.size());
+        for (size_t k = 0; k < l.tiles.size(); ++k) file_u16(f, l.tiles[k]);
+    }
+    bool ok = !ferror(f) && fflush(f) == 0;
+    if (fclose(f) != 0) ok = false;
+    if (ok) ok = rename(tmp.c_str(), path.c_str()) == 0;
+    if (!ok) { fprintf(stderr, "[gs] failed saving world '%s': %s\n", w.name.c_str(), strerror(errno)); remove(tmp.c_str()); }
+    return ok;
+}
+
+static bool read_exact(FILE* f, void* p, size_t n) { return fread(p, 1, n, f) == n; }
+static bool read_u8(FILE* f, uint8_t& v) { return read_exact(f, &v, 1); }
+static bool read_u16(FILE* f, uint16_t& v) { return read_exact(f, &v, sizeof v); }
+static bool read_u32(FILE* f, uint32_t& v) { return read_exact(f, &v, sizeof v); }
+static bool read_i64(FILE* f, int64_t& v) { return read_exact(f, &v, sizeof v); }
+static bool read_float(FILE* f, float& v) { return read_exact(f, &v, sizeof v); }
+static bool read_string(FILE* f, std::string& s, uint32_t limit = 65536) {
+    uint32_t n; if (!read_u32(f, n) || n > limit) return false;
+    s.resize(n); return n == 0 || read_exact(f, &s[0], n);
+}
+
+static bool load_world(const std::string& requested, WorldData& w) {
+    std::string path = world_path(requested);
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char magic[8]; uint32_t version, width, height, count, u; int64_t stamp;
+    bool ok = read_exact(f, magic, 8) && memcmp(magic, "BLDWORLD", 8) == 0 &&
+              read_u32(f, version) && (version == 1 || version == 2) &&
+              read_string(f, w.name, 1024) &&
+              w.name == requested && read_u32(f, width) && read_u32(f, height) &&
+              width > 0 && height > 0 && width <= 1000 && height <= 1000;
+    if (ok) { w.w = (int)width; w.h = (int)height; ok = read_u32(f, u); w.spawnX = (int)u; }
+    if (ok) { ok = read_u32(f, u); w.spawnY = (int)u; }
+    if (ok) ok = read_u32(f, count) && count == width * height && count <= 1000000;
+    if (ok) w.tiles.resize(count);
+    for (uint32_t i = 0; ok && i < count; ++i) {
+        Tile& t = w.tiles[i]; uint32_t listCount; stamp = 0;
+        ok = read_u16(f, t.fg) && read_u16(f, t.bg);
+        if (ok && version >= 2) ok = read_u16(f, t.flags);
+        if (ok) ok = read_u8(f, t.damage) && read_i64(f, stamp);
+        t.healAt = (time_t)stamp;
+        if (ok) { ok = read_i64(f, stamp); t.plantedAt = (time_t)stamp; }
+        if (ok) ok = read_u8(f, t.extra.type) && read_string(f, t.extra.s1) &&
+                     read_string(f, t.extra.s2) && read_string(f, t.extra.s3) &&
+                     read_u8(f, t.extra.b1) && read_u32(f, t.extra.u1) &&
+                     read_u32(f, t.extra.age) && read_u8(f, t.extra.stage) &&
+                     read_u32(f, listCount) && listCount <= 100000;
+        if (ok) t.extra.list.resize(listCount);
+        for (uint32_t k = 0; ok && k < listCount; ++k) ok = read_u32(f, t.extra.list[k]);
+    }
+    uint32_t objectCount = 0, lockCount = 0;
+    if (ok) ok = read_u32(f, w.nextObjectId) && read_u32(f, objectCount) && objectCount <= 100000;
+    if (ok) w.objects.resize(objectCount);
+    for (uint32_t i = 0; ok && i < objectCount; ++i) {
+        WorldObject& o = w.objects[i];
+        ok = read_u32(f, o.id) && read_u16(f, o.itemId) && read_float(f, o.x) &&
+             read_float(f, o.y) && read_u8(f, o.count) && read_u8(f, o.flags);
+    }
+    if (ok) ok = read_u32(f, lockCount) && lockCount <= 100000;
+    if (ok) w.locks.resize(lockCount);
+    for (uint32_t i = 0; ok && i < lockCount; ++i) {
+        WorldLock& l = w.locks[i]; uint32_t tileCount;
+        ok = read_u32(f, u); l.x = (int)u;
+        if (ok) { ok = read_u32(f, u); l.y = (int)u; }
+        if (ok) { ok = read_u32(f, u); l.owner = (int)u; }
+        if (ok) ok = read_u32(f, tileCount) && tileCount <= count;
+        if (ok) l.tiles.resize(tileCount);
+        for (uint32_t k = 0; ok && k < tileCount; ++k) ok = read_u16(f, l.tiles[k]);
+    }
+    fclose(f);
+    if (!ok) fprintf(stderr, "[gs] ignored invalid world save '%s'\n", path.c_str());
+    return ok;
+}
+
+static void save_all_worlds() {
+    for (std::map<std::string, WorldData>::const_iterator it = g_worlds.begin();
+         it != g_worlds.end(); ++it) save_world(it->second);
+}
 
 static const int WORLD_W = 100, WORLD_H = 60;
 static const int GROUND  = 30;           // first solid row
@@ -474,6 +636,12 @@ enum { IT_BLANK = 0, IT_DIRT = 2, IT_DOOR = 6, IT_BEDROCK = 8, IT_ROCK = 10,
 static WorldData& get_world(const std::string& name) {
     auto it = g_worlds.find(name);
     if (it != g_worlds.end()) return it->second;
+
+    WorldData saved;
+    if (load_world(name, saved)) {
+        printf("[gs] loaded world '%s' %dx%d from disk\n", name.c_str(), saved.w, saved.h);
+        return g_worlds.emplace(name, std::move(saved)).first->second;
+    }
 
     WorldData w;
     w.name = name;
@@ -543,7 +711,9 @@ static WorldData& get_world(const std::string& name) {
 
     printf("[gs] generated world '%s' %dx%d, spawn %d,%d\n",
            name.c_str(), w.w, w.h, w.spawnX, w.spawnY);
-    return g_worlds.emplace(name, std::move(w)).first->second;
+    WorldData& created = g_worlds.emplace(name, std::move(w)).first->second;
+    save_world(created);
+    return created;
 }
 
 /* TileExtra::Serialize 0x43f070: uint8 type, then by type
@@ -1666,6 +1836,8 @@ static void join_world(ENetPeer* peer, Player& pl, const std::string& wname) {
 
 /* ==================================================================== */
 int main() {
+    signal(SIGINT, request_stop);
+    signal(SIGTERM, request_stop);
     g_verbose = getenv("BUILDO_VERBOSE") != NULL;
 
     if (enet_initialize() != 0) { fprintf(stderr,"enet init failed\n"); return 1; }
@@ -1712,11 +1884,12 @@ int main() {
 
     int nextNetID = 1;
     ENetEvent ev;
-    time_t lastGrow = 0;
-    while (true) {
+    time_t lastGrow = 0, lastSave = 0;
+    while (!g_stop) {
         time_t nowTick = time(NULL);
         if (nowTick != lastGrow) { lastGrow = nowTick; grow_plants(); }
-        while (enet_host_service(host, &ev, 200) > 0) {
+        if (nowTick - lastSave >= 5) { lastSave = nowTick; save_all_worlds(); }
+        while (!g_stop && enet_host_service(host, &ev, 200) > 0) {
             switch (ev.type) {
 
             case ENET_EVENT_TYPE_CONNECT: {
